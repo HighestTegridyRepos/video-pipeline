@@ -123,9 +123,27 @@ export async function assembleVideo(options: AssemblyOptions): Promise<AssemblyR
       }
     }
 
+    // ── 1.5. Force-crop to remove letterboxing ─────────────────
+    // Scale up to fill target resolution and center-crop (removes black bars)
+    const [resW, resH] = resolution.split("x").map(Number)
+    const croppedPaths: string[] = []
+    for (let i = 0; i < clipPaths.length; i++) {
+      const croppedPath = join(tmpDir, `clip_cropped_${i}.mp4`)
+      try {
+        execSync(
+          `ffmpeg -y -i "${clipPaths[i]}" -vf "scale=${resW}:${resH}:force_original_aspect_ratio=increase,crop=${resW}:${resH}" -c:v libx264 -preset fast -c:a copy "${croppedPath}" 2>/dev/null`,
+          { timeout: 30000 }
+        )
+        croppedPaths.push(croppedPath)
+      } catch {
+        // If crop fails, use original clip
+        croppedPaths.push(clipPaths[i])
+      }
+    }
+
     // ── 2. Concatenate clips ─────────────────────────────────────
     const concatListPath = join(tmpDir, "concat.txt")
-    const concatContent = clipPaths.map(p => `file '${p}'`).join("\n")
+    const concatContent = croppedPaths.map(p => `file '${p}'`).join("\n")
     writeFileSync(concatListPath, concatContent)
 
     const concatPath = join(tmpDir, "concat.mp4")
@@ -146,12 +164,11 @@ export async function assembleVideo(options: AssemblyOptions): Promise<AssemblyR
 
     // ── 3. Build filter chain for overlays ───────────────────────
     let currentInput = concatPath
-    const [resW, resH] = resolution.split("x").map(Number)
 
-    // Scale to target resolution if needed
+    // Ensure final resolution + fps (clips already cropped to fill in step 1.5)
     const scaledPath = join(tmpDir, "scaled.mp4")
     execSync(
-      `ffmpeg -y -i "${currentInput}" -vf "scale=${resW}:${resH}:force_original_aspect_ratio=decrease,pad=${resW}:${resH}:(ow-iw)/2:(oh-ih)/2" -c:v libx264 -preset fast -r ${fps} "${scaledPath}" 2>/dev/null`,
+      `ffmpeg -y -i "${currentInput}" -vf "scale=${resW}:${resH}:force_original_aspect_ratio=increase,crop=${resW}:${resH}" -c:v libx264 -preset fast -r ${fps} "${scaledPath}" 2>/dev/null`,
       { timeout: 60000 }
     )
     currentInput = scaledPath

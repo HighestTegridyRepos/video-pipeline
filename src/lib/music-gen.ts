@@ -89,20 +89,27 @@ export async function generateMusic(
       callbacks: {
         onmessage: (msg) => {
           // Collect audio data from server messages
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const data = msg as any
-          if (data.serverContent?.audioChunks) {
-            for (const chunk of data.serverContent.audioChunks) {
+          if (msg.serverContent?.audioChunks) {
+            for (const chunk of msg.serverContent.audioChunks) {
               if (chunk.data) {
-                // Decode base64 audio chunk to float32 samples
+                // Decode base64 audio chunk — Lyria outputs 48kHz stereo 16-bit PCM
                 const buf = Buffer.from(chunk.data, "base64")
-                for (let i = 0; i < buf.length; i += 4) {
-                  if (i + 4 <= buf.length) {
-                    allSamples.push(buf.readFloatLE(i))
+                // Try reading as int16 PCM first (most common Lyria output)
+                for (let i = 0; i < buf.length; i += 2) {
+                  if (i + 2 <= buf.length) {
+                    const sample = buf.readInt16LE(i)
+                    allSamples.push(sample / 32768) // normalize to -1..1
                   }
                 }
               }
             }
+            if (allSamples.length % (sampleRate * channels * 5) < 1000) {
+              logInfo(ROUTE, `Audio samples collected: ${allSamples.length} / ${samplesNeeded}`)
+            }
+          } else if (msg.setupComplete) {
+            logInfo(ROUTE, "Lyria setup complete, waiting for audio...")
+          } else if (msg.filteredPrompt) {
+            logWarn(ROUTE, `Prompt filtered by Lyria: ${JSON.stringify(msg.filteredPrompt)}`)
           }
 
           // Check if we have enough samples

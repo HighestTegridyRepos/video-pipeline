@@ -103,13 +103,27 @@ export async function POST(request: NextRequest) {
     // ── STEP 1: Generate all hero images (parallel) ──────────────
     logInfo(ROUTE, `Step 1: Generating ${scenes.length} hero images`)
 
+    const aspectRatio = assembly.aspectRatio || "9:16"
+
+    // Determine orientation suffix for image prompts based on aspect ratio
+    let orientationSuffix = ""
+    if (aspectRatio === "9:16") {
+      orientationSuffix = " Portrait orientation, vertical composition, taller than wide, 9:16 aspect ratio."
+    } else if (aspectRatio === "16:9") {
+      orientationSuffix = " Landscape orientation, horizontal composition, wider than tall, 16:9 aspect ratio."
+    } else if (aspectRatio === "1:1") {
+      orientationSuffix = " Square composition, 1:1 aspect ratio."
+    }
+
     const imageResults = await Promise.allSettled(
       scenes.map(async (scene) => {
         if (scene.imageDataUrl) {
           logInfo(ROUTE, "Using provided image, skipping generation")
           return { imageDataUrl: scene.imageDataUrl, skipped: true }
         }
-        const result = await generateImage(scene.imagePrompt)
+        // Append orientation to prompt so Nano Banana generates correct aspect ratio
+        const orientedPrompt = scene.imagePrompt + orientationSuffix
+        const result = await generateImage(orientedPrompt)
         costs.images += IMAGE_COST
         return { imageDataUrl: result.imageDataUrl, skipped: false }
       })
@@ -138,8 +152,6 @@ export async function POST(request: NextRequest) {
 
     // ── STEP 2: Generate videos + music (parallel) ───────────────
     logInfo(ROUTE, "Step 2: Generating videos and music in parallel")
-
-    const aspectRatio = assembly.aspectRatio || "9:16"
 
     // Video generation promises
     const videoPromises = imageData.map(async ({ imageDataUrl, index }) => {
