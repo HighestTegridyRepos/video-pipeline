@@ -15,6 +15,7 @@ interface MusicRequest {
   bpm?: number            // beats per minute, default 120
   instrumental?: boolean  // hint in prompt, default true
   temperature?: number    // generation temperature
+  vocals?: boolean        // true → use Lyria 3 (Vertex AI) for vocals
 }
 
 export async function POST(request: NextRequest) {
@@ -31,7 +32,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 })
   }
 
-  const { prompt, duration = 15, bpm = 120, instrumental = true, temperature } = body
+  const { prompt, duration = 15, bpm = 120, instrumental = true, temperature, vocals = false } = body
 
   if (!prompt || typeof prompt !== "string" || prompt.trim().length < 5) {
     return NextResponse.json({ error: "prompt (string, min 5 chars) is required" }, { status: 400 })
@@ -50,6 +51,7 @@ export async function POST(request: NextRequest) {
       bpm,
       instrumental,
       temperature,
+      vocals,
     })
 
     return NextResponse.json({

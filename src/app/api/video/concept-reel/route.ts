@@ -35,6 +35,7 @@ interface MusicInput {
   duration?: number         // seconds, default 20
   bpm?: number
   instrumental?: boolean
+  vocals?: boolean          // true → use Lyria 3 (Vertex AI) for vocals
   musicDataUrl?: string     // skip music gen if provided
 }
 
@@ -192,17 +193,20 @@ export async function POST(request: NextRequest) {
         return music.musicDataUrl
       }
       try {
+        logInfo(ROUTE, "Starting music generation...")
         const result = await generateMusic(
-          music.instrumental !== false
+          music.instrumental !== false && !music.vocals
             ? `${music.prompt}. Instrumental only, no vocals.`
             : music.prompt,
           {
             duration: music.duration || 20,
             bpm: music.bpm || 120,
             instrumental: music.instrumental !== false,
+            vocals: music.vocals || false,
           }
         )
         costs.music += MUSIC_COST
+        logInfo(ROUTE, `Music generated: ${result.duration}s, model: ${result.model}`)
         return result.audioDataUrl
       } catch (err) {
         logWarn(ROUTE, `Music generation failed: ${(err as Error).message}`)
