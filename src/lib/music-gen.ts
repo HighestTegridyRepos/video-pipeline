@@ -212,7 +212,7 @@ export async function generateMusicVertex(
   const location = process.env.VERTEX_LOCATION || "us-central1"
   const model = "lyria-002"
 
-  logInfo(ROUTE, `Lyria 3 (Vertex AI): generating music with vocals`, { model })
+  logInfo(ROUTE, `Lyria 3 (Vertex AI): generating music`, { model })
 
   // Get access token via gcloud
   let token: string
@@ -226,20 +226,38 @@ export async function generateMusicVertex(
 
   const endpoint = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${model}:predict`
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      instances: [{ prompt }],
-      parameters: {
-        sampleCount: options.sampleCount || 1,
+  const makeRequest = async (authToken: string) => {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${authToken}`,
+        "Content-Type": "application/json",
       },
-    }),
-    signal: AbortSignal.timeout(120_000),
-  })
+      body: JSON.stringify({
+        instances: [{ prompt }],
+        parameters: {
+          sampleCount: options.sampleCount || 1,
+        },
+      }),
+      signal: AbortSignal.timeout(120_000),
+    })
+    return resp
+  }
+
+  let response = await makeRequest(token)
+
+  // Retry once on 401 with a fresh token
+  if (response.status === 401) {
+    logWarn(ROUTE, "Vertex returned 401, refreshing gcloud token and retrying...")
+    try {
+      token = execSync("gcloud auth print-access-token", { timeout: 10000 })
+        .toString()
+        .trim()
+    } catch (err) {
+      throw new Error(`gcloud auth refresh failed: ${(err as Error).message}`)
+    }
+    response = await makeRequest(token)
+  }
 
   if (!response.ok) {
     const text = await response.text()
@@ -253,8 +271,9 @@ export async function generateMusicVertex(
     throw new Error("Lyria 3 returned no predictions")
   }
 
-  const audioData = predictions[0].audioContent || predictions[0].audio_content
+  const audioData = predictions[0].audioContent || predictions[0].audio_content || predictions[0].bytesBase64Encoded
   if (!audioData) {
+    logWarn(ROUTE, `Lyria 3 prediction keys: ${Object.keys(predictions[0]).join(", ")}`)
     throw new Error("Lyria 3 returned no audio content")
   }
 
@@ -275,6 +294,8 @@ export async function generateMusicVertex(
 }
 
 // ── Unified entry point ───────────────────────────────────────────
+// NOTE: Lyria RealTime (WebSocket) is disabled — ai.live.music.connect()
+// is broken in @google/genai v1.46+. All music routes through Vertex/Lyria 3.
 
 export async function generateMusic(
   prompt: string,
@@ -286,29 +307,6 @@ export async function generateMusic(
     vocals?: boolean  // true → use Lyria 3 (Vertex AI) for vocals
   } = {},
 ): Promise<MusicGenResult> {
-  if (options.vocals) {
-    logInfo(ROUTE, "Using Lyria 3 (Vertex AI) for vocal music")
-    return generateMusicVertex(prompt, { duration: options.duration })
-  }
-
-  // Try Lyria RealTime first
-  logInfo(ROUTE, "Using Lyria RealTime for instrumental music")
-  try {
-    return await generateMusicRealtime(prompt, {
-      duration: options.duration,
-      bpm: options.bpm,
-      temperature: options.temperature,
-    })
-  } catch (err) {
-    logWarn(ROUTE, `Lyria RealTime failed: ${(err as Error).message}`)
-
-    // Fallback to Lyria 3 via Vertex AI if gcloud is configured
-    logInfo(ROUTE, "Falling back to Lyria 3 (Vertex AI)")
-    try {
-      return await generateMusicVertex(prompt, { duration: options.duration })
-    } catch (fallbackErr) {
-      logWarn(ROUTE, `Lyria 3 fallback also failed: ${(fallbackErr as Error).message}`)
-      throw new Error(`Music generation failed. RealTime: ${(err as Error).message}. Vertex: ${(fallbackErr as Error).message}`)
-    }
-  }
+  logInfo(ROUTE, `Using Lyria 3 (Vertex AI) for music generation (vocals: ${options.vocals ?? false})`)
+  return generateMusicVertex(prompt, { duration: options.duration })
 }
