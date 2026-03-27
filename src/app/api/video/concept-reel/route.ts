@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from "next/server"
 import { checkApiKey } from "@/lib/auth"
-import { generateImage, ImageAuditResult } from "@/lib/image-gen"
 import { generateVideo } from "@/lib/video-gen"
 import { generateMusic } from "@/lib/music-gen"
 import { generateIdea, ContentBrief } from "@/lib/idea-gen"
+import { selectBestScenes, SelectedScene } from "@/lib/image-selection"
+import { auditVideo, VideoAuditResult } from "@/lib/video-audit"
+import { recordBrief, updateVideoScore } from "@/lib/brief-history"
 import { assembleVideo, TextOverlay, Watermark } from "@/lib/assembly"
 import { logInfo, logWarn } from "@/lib/logger"
+import { ImageAuditResult } from "@/lib/image-gen"
 import { v4 as uuid } from "uuid"
 
 const ROUTE = "api/video/concept-reel"
@@ -25,27 +28,29 @@ const MUSIC_COST = 0.00  // effectively free
 // ── Types ─────────────────────────────────────────────────────────
 
 interface SceneInput {
+  sceneNumber?: number
   imagePrompt: string
   animationPrompt: string
   duration?: number         // 4-8, default 4
+  purpose?: string
   imageDataUrl?: string     // skip image gen if provided
 }
 
 interface MusicInput {
   prompt: string
-  duration?: number         // seconds, default 20
+  duration?: number
   bpm?: number
   instrumental?: boolean
-  vocals?: boolean          // true → use Lyria 3 (Vertex AI) for vocals
+  vocals?: boolean
   mood?: string
   vocalStyle?: string
   vocalLyrics?: string
-  musicDataUrl?: string     // skip music gen if provided
+  musicDataUrl?: string
 }
 
 interface AssemblyInput {
-  aspectRatio?: string      // "9:16", "16:9", "1:1"
-  targetDuration?: number   // seconds
+  aspectRatio?: string
+  targetDuration?: number
   cutStyle?: "fast" | "full"
   resolution?: string
   fps?: number
@@ -56,37 +61,36 @@ interface AssemblyInput {
 }
 
 interface ConceptReelRequest {
-  // Existing flow: provide concept + scenes directly
   concept?: string
   scenes?: SceneInput[]
-
-  // New flow: provide brand/niche and auto-generate brief
   brand?: string
   niche?: string
   platform?: string
   format?: string
   tone?: string
   avoid?: string[]
-
   music?: MusicInput
   assembly?: AssemblyInput
   videoModel?: string
 }
 
 interface SceneResult {
+  sceneNumber: number
   imageDataUrl: string
   videoDataUrl: string
   originalDuration: number
   trimmedDuration: number | null
   imagePrompt: string
   animationPrompt: string
+  purpose: string
   auditResult?: ImageAuditResult
 }
 
 // ── Main handler ──────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
-  logInfo(ROUTE, "Concept reel request received")
+  const reelId = uuid()
+  logInfo(ROUTE, `Concept reel request received (id: ${reelId})`)
 
   if (!checkApiKey(request)) {
     return NextResponse.json({ error: "Invalid API key" }, { status: 401 })
@@ -135,12 +139,11 @@ export async function POST(request: NextRequest) {
       requestConcept = brief.concept
       requestScenes = brief.scenes
 
-      // Use brief's music if not overridden by caller
       if (!body.music) {
         body.music = brief.music
       }
 
-      logInfo(ROUTE, `Brief generated: "${brief.hookStatement}" (score: ${brief.viralScore})`)
+      logInfo(ROUTE, `Brief generated: "${brief.hookStatement}" (score: ${brief.viralScore}, scenes: ${brief.scenes.length})`)
     } catch (err) {
       logWarn(ROUTE, `Idea generation failed: ${(err as Error).message}`)
       return NextResponse.json(
@@ -167,12 +170,9 @@ export async function POST(request: NextRequest) {
   const costs = { images: 0, videos: 0, music: 0, total: 0 }
 
   try {
-    // ── STEP 1: Generate all hero images (parallel) ──────────────
-    logInfo(ROUTE, `Step 1: Generating ${scenes.length} hero images`)
-
+    // ── STEP 1: Generate + audit + select best images ───────────
     const aspectRatio = assembly.aspectRatio || "9:16"
 
-    // Determine orientation suffix for image prompts based on aspect ratio
     let orientationSuffix = ""
     if (aspectRatio === "9:16") {
       orientationSuffix = " Portrait orientation, vertical composition, taller than wide, 9:16 aspect ratio."
@@ -182,70 +182,43 @@ export async function POST(request: NextRequest) {
       orientationSuffix = " Square composition, 1:1 aspect ratio."
     }
 
-    const imageResults = await Promise.allSettled(
-      scenes.map(async (scene) => {
-        if (scene.imageDataUrl) {
-          logInfo(ROUTE, "Using provided image, skipping generation")
-          return { imageDataUrl: scene.imageDataUrl, skipped: true, auditResult: undefined as ImageAuditResult | undefined }
-        }
+    logInfo(ROUTE, `Step 1: Generating and selecting best images from ${scenes.length} scenes`)
 
-        const orientedPrompt = scene.imagePrompt + orientationSuffix
-
-        // Generate with audit enabled
-        const result = await generateImage(orientedPrompt, {
-          audit: true,
-          auditAspectRatio: aspectRatio,
-          maxRetries: 1,
-        })
-
-        costs.images += IMAGE_COST
-
-        // Log audit result
-        if (result.auditResult) {
-          const status = result.auditResult.pass ? "✓" : "✗"
-          const retry = result.retried ? " (retried)" : ""
-          logInfo(ROUTE, `Image ${status}: score ${result.auditResult.score}/10${retry}`)
-          if (!result.auditResult.pass && result.auditResult.issues.length > 0) {
-            logWarn(ROUTE, `  Issues: ${result.auditResult.issues.join(", ")}`)
-          }
-        }
-
-        return { imageDataUrl: result.imageDataUrl, skipped: false, auditResult: result.auditResult }
-      })
+    const selection = await selectBestScenes(
+      scenes.map((s, i) => ({
+        sceneNumber: s.sceneNumber ?? i + 1,
+        imagePrompt: s.imagePrompt,
+        animationPrompt: s.animationPrompt,
+        duration: s.duration || 4,
+        purpose: s.purpose || "scene",
+        imageDataUrl: s.imageDataUrl,
+      })),
+      { aspectRatio, orientationSuffix },
     )
 
-    // Collect successful images, track failures
-    const imageData: Array<{ imageDataUrl: string; index: number; auditResult?: ImageAuditResult }> = []
-    const failedScenes: number[] = []
+    costs.images += selection.totalGenerated * IMAGE_COST
 
-    for (let i = 0; i < imageResults.length; i++) {
-      if (imageResults[i].status === "fulfilled") {
-        const val = (imageResults[i] as PromiseFulfilledResult<{ imageDataUrl: string; skipped: boolean; auditResult?: ImageAuditResult }>).value
-        imageData.push({ imageDataUrl: val.imageDataUrl, index: i, auditResult: val.auditResult })
-      } else {
-        const reason = (imageResults[i] as PromiseRejectedResult).reason
-        logWarn(ROUTE, `Scene ${i} image failed: ${reason}`)
-        failedScenes.push(i)
-      }
-    }
-
-    if (imageData.length === 0) {
+    if (selection.selected.length === 0) {
       return NextResponse.json({ error: "All image generations failed" }, { status: 502 })
     }
 
-    logInfo(ROUTE, `Step 1 done: ${imageData.length}/${scenes.length} images generated`)
+    if (selection.dropped.length > 0) {
+      logInfo(ROUTE, `Dropped ${selection.dropped.length} scenes: ${selection.dropped.map(d => `#${d.sceneNumber} (${d.reason})`).join(", ")}`)
+    }
+
+    logInfo(ROUTE, `Step 1 done: ${selection.selected.length} scenes selected (${selection.totalRetried} retried)`)
 
     // ── STEP 2: Generate videos + music (parallel) ───────────────
     logInfo(ROUTE, "Step 2: Generating videos and music in parallel")
 
-    // Video generation promises
-    const videoPromises = imageData.map(async ({ imageDataUrl, index, auditResult }) => {
-      const scene = scenes[index]
-      const duration = Math.min(Math.max(Math.round(scene.duration || 4), 4), 8)
+    const selectedScenes = selection.selected
 
-      // Parse image data URL for Veo
-      const match = imageDataUrl.match(/^data:(image\/[^;]+);base64,(.+)$/)
-      if (!match) throw new Error(`Invalid image data URL for scene ${index}`)
+    // Video generation promises
+    const videoPromises = selectedScenes.map(async (scene) => {
+      const duration = Math.min(Math.max(Math.round(scene.duration), 4), 8)
+
+      const match = scene.imageDataUrl.match(/^data:(image\/[^;]+);base64,(.+)$/)
+      if (!match) throw new Error(`Invalid image data URL for scene ${scene.sceneNumber}`)
 
       const result = await generateVideo(scene.animationPrompt, {
         imageBase64: match[2],
@@ -259,18 +232,18 @@ export async function POST(request: NextRequest) {
       costs.videos += VIDEO_COST[activeModel] || 1.60
 
       return {
-        index,
-        imageDataUrl,
+        sceneNumber: scene.sceneNumber,
+        imageDataUrl: scene.imageDataUrl,
         videoDataUrl: result.videoDataUrl,
         originalDuration: duration,
         imagePrompt: scene.imagePrompt,
         animationPrompt: scene.animationPrompt,
-        auditResult,
+        purpose: scene.purpose,
+        auditResult: scene.auditResult,
       }
     })
 
     // Music generation promise (parallel with videos)
-    // Always generate music. If no params provided, infer from concept.
     let musicDataUrl: string | null = null
     const musicPromise = (async () => {
       if (music?.musicDataUrl) {
@@ -317,12 +290,14 @@ export async function POST(request: NextRequest) {
       if (result.status === "fulfilled") {
         const val = result.value
         sceneResults.push({
+          sceneNumber: val.sceneNumber,
           imageDataUrl: val.imageDataUrl,
           videoDataUrl: val.videoDataUrl,
           originalDuration: val.originalDuration,
-          trimmedDuration: null, // set after assembly
+          trimmedDuration: null,
           imagePrompt: val.imagePrompt,
           animationPrompt: val.animationPrompt,
+          purpose: val.purpose,
           auditResult: val.auditResult,
         })
       } else {
@@ -334,6 +309,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "All video generations failed" }, { status: 502 })
     }
 
+    // Sort by scene number for correct narrative order
+    sceneResults.sort((a, b) => a.sceneNumber - b.sceneNumber)
+
     logInfo(ROUTE, `Step 2 done: ${sceneResults.length} videos, music: ${musicDataUrl ? "yes" : "no"}`)
 
     // ── STEP 3: Assemble final reel ──────────────────────────────
@@ -342,7 +320,6 @@ export async function POST(request: NextRequest) {
     const targetDuration = assembly.targetDuration || undefined
     const cutStyle = assembly.cutStyle || "fast"
 
-    // Calculate trim durations for response
     if (cutStyle === "fast" && targetDuration) {
       const trimPer = targetDuration / sceneResults.length
       for (const scene of sceneResults) {
@@ -372,11 +349,51 @@ export async function POST(request: NextRequest) {
 
     logInfo(ROUTE, "Step 3 done: Final reel assembled")
 
+    // ── STEP 4: Final video audit ────────────────────────────────
+    logInfo(ROUTE, "Step 4: Final video quality audit")
+
+    let videoAudit: VideoAuditResult | undefined
+    try {
+      videoAudit = await auditVideo(assemblyResult.videoDataUrl, concept)
+    } catch (err) {
+      logWarn(ROUTE, `Final video audit failed: ${(err as Error).message}`)
+    }
+
+    // ── Record to brief history ──────────────────────────────────
+    const imageScores = sceneResults.map(s => s.auditResult?.score ?? 0)
+    const avgImageScore = imageScores.length > 0
+      ? Math.round((imageScores.reduce((a, b) => a + b, 0) / imageScores.length) * 10) / 10
+      : 0
+
+    if (requestBrief) {
+      recordBrief({
+        id: reelId,
+        timestamp: new Date().toISOString(),
+        brand: body.brand || "unknown",
+        niche: body.niche || "unknown",
+        platform: body.platform || "instagram",
+        tone: body.tone,
+        hookStatement: requestBrief.hookStatement,
+        concept,
+        viralScore: requestBrief.viralScore,
+        viralReasoning: requestBrief.viralReasoning,
+        sceneCount: sceneResults.length,
+        imageScores,
+        avgImageScore,
+        finalVideoScore: videoAudit?.score,
+        finalVideoVerdict: videoAudit?.verdict,
+      })
+    }
+
+    if (videoAudit && requestBrief) {
+      updateVideoScore(reelId, videoAudit.score, videoAudit.verdict)
+    }
+
     // ── Build response ───────────────────────────────────────────
     costs.total = costs.images + costs.videos + costs.music
 
     return NextResponse.json({
-      id: uuid(),
+      id: reelId,
       status: "complete",
       concept,
       brief: requestBrief || undefined,
@@ -384,14 +401,23 @@ export async function POST(request: NextRequest) {
       duration: assemblyResult.duration,
       fileSize: assemblyResult.fileSize,
       scenes: sceneResults.map(s => ({
+        sceneNumber: s.sceneNumber,
         imageDataUrl: s.imageDataUrl,
         videoDataUrl: s.videoDataUrl,
         originalDuration: s.originalDuration,
         trimmedDuration: s.trimmedDuration,
         imagePrompt: s.imagePrompt,
         animationPrompt: s.animationPrompt,
+        purpose: s.purpose,
         auditResult: s.auditResult,
       })),
+      imageSelection: {
+        generated: selection.totalGenerated,
+        selected: selection.selected.length,
+        dropped: selection.dropped,
+        retried: selection.totalRetried,
+      },
+      videoAudit: videoAudit || undefined,
       musicDataUrl,
       cost: {
         images: costs.images,
