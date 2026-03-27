@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs"
-import { join, dirname } from "path"
+import { join } from "path"
 import { logInfo, logWarn } from "./logger"
 
 const ROUTE = "brief-history"

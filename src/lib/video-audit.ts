@@ -1,6 +1,6 @@
 import { getGeminiClient } from "./gemini"
 import { logInfo, logWarn } from "./logger"
-import { execSync, } from "child_process"
+import { execSync } from "child_process"
 import { writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "fs"
 import { join } from "path"
 import { v4 as uuid } from "uuid"
