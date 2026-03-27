@@ -114,32 +114,40 @@ export async function POST(request: NextRequest) {
     }
 
     logInfo(ROUTE, "Generating idea from brand/niche...")
-    const brief = await generateIdea({
-      brand: body.brand,
-      niche: body.niche,
-      platform: body.platform || "instagram",
-      format: body.format || "reel",
-      tone: body.tone,
-      avoid: body.avoid,
-    })
+    try {
+      const brief = await generateIdea({
+        brand: body.brand,
+        niche: body.niche,
+        platform: body.platform || "instagram",
+        format: body.format || "reel",
+        tone: body.tone,
+        avoid: body.avoid,
+      })
 
-    if (brief.error) {
+      if (brief.error) {
+        return NextResponse.json(
+          { error: `Idea generation failed: ${brief.reason}` },
+          { status: 400 }
+        )
+      }
+
+      requestBrief = brief
+      requestConcept = brief.concept
+      requestScenes = brief.scenes
+
+      // Use brief's music if not overridden by caller
+      if (!body.music) {
+        body.music = brief.music
+      }
+
+      logInfo(ROUTE, `Brief generated: "${brief.hookStatement}" (score: ${brief.viralScore})`)
+    } catch (err) {
+      logWarn(ROUTE, `Idea generation failed: ${(err as Error).message}`)
       return NextResponse.json(
-        { error: `Idea generation failed: ${brief.reason}` },
-        { status: 400 }
+        { error: `Idea generation failed: ${(err as Error).message}` },
+        { status: 502 }
       )
     }
-
-    requestBrief = brief
-    requestConcept = brief.concept
-    requestScenes = brief.scenes
-
-    // Use brief's music if not overridden by caller
-    if (!body.music) {
-      body.music = brief.music
-    }
-
-    logInfo(ROUTE, `Brief generated: "${brief.hookStatement}" (score: ${brief.viralScore})`)
   }
 
   const concept = requestConcept
