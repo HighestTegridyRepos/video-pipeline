@@ -22,5 +22,8 @@ export const VEO_3_1 = "veo-3.1-generate-preview"
 export const VEO_3_1_FAST = "veo-3.1-fast-generate-preview"
 export const VIDEO_MODEL = VEO_3_1
 
+// ── Text models ──────────────────────────────────────────────────
+export const GEMINI_FLASH = "gemini-2.5-flash"
+
 // ── Music models ────────────────────────────────────────────────
 export const LYRIA_REALTIME = "models/lyria-realtime-exp"

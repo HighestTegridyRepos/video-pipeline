@@ -88,7 +88,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Single image
-    const result = await generateImage(prompt, model)
+    const result = await generateImage(prompt, { model })
 
     return NextResponse.json({
       id: uuid(),
