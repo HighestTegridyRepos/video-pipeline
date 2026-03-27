@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server"
 import { checkApiKey } from "@/lib/auth"
-import { generateImage } from "@/lib/image-gen"
+import { generateImage, ImageAuditResult } from "@/lib/image-gen"
 import { generateVideo } from "@/lib/video-gen"
 import { generateMusic } from "@/lib/music-gen"
+import { generateIdea, ContentBrief } from "@/lib/idea-gen"
 import { assembleVideo, TextOverlay, Watermark } from "@/lib/assembly"
 import { logInfo, logWarn } from "@/lib/logger"
 import { v4 as uuid } from "uuid"
@@ -36,6 +37,9 @@ interface MusicInput {
   bpm?: number
   instrumental?: boolean
   vocals?: boolean          // true → use Lyria 3 (Vertex AI) for vocals
+  mood?: string
+  vocalStyle?: string
+  vocalLyrics?: string
   musicDataUrl?: string     // skip music gen if provided
 }
 
@@ -52,8 +56,18 @@ interface AssemblyInput {
 }
 
 interface ConceptReelRequest {
-  concept: string
-  scenes: SceneInput[]
+  // Existing flow: provide concept + scenes directly
+  concept?: string
+  scenes?: SceneInput[]
+
+  // New flow: provide brand/niche and auto-generate brief
+  brand?: string
+  niche?: string
+  platform?: string
+  format?: string
+  tone?: string
+  avoid?: string[]
+
   music?: MusicInput
   assembly?: AssemblyInput
   videoModel?: string
@@ -66,6 +80,7 @@ interface SceneResult {
   trimmedDuration: number | null
   imagePrompt: string
   animationPrompt: string
+  auditResult?: ImageAuditResult
 }
 
 // ── Main handler ──────────────────────────────────────────────────
@@ -77,21 +92,64 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid API key" }, { status: 401 })
   }
 
-  let body: ConceptReelRequest
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let body: any
   try {
     body = await request.json()
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 })
   }
 
-  const { concept, scenes, music, assembly = {}, videoModel } = body
+  // ── Idea generation (if no scenes provided) ─────────────────────
+  let requestConcept: string | undefined = body.concept
+  let requestScenes: SceneInput[] | undefined = body.scenes
+  let requestBrief: ContentBrief | undefined
+
+  if (!requestScenes || !Array.isArray(requestScenes) || requestScenes.length === 0) {
+    if (!body.brand || !body.niche) {
+      return NextResponse.json(
+        { error: "Either (concept + scenes) OR (brand + niche + platform + format) required" },
+        { status: 400 }
+      )
+    }
+
+    logInfo(ROUTE, "Generating idea from brand/niche...")
+    const brief = await generateIdea({
+      brand: body.brand,
+      niche: body.niche,
+      platform: body.platform || "instagram",
+      format: body.format || "reel",
+      tone: body.tone,
+      avoid: body.avoid,
+    })
+
+    if (brief.error) {
+      return NextResponse.json(
+        { error: `Idea generation failed: ${brief.reason}` },
+        { status: 400 }
+      )
+    }
+
+    requestBrief = brief
+    requestConcept = brief.concept
+    requestScenes = brief.scenes
+
+    // Use brief's music if not overridden by caller
+    if (!body.music) {
+      body.music = brief.music
+    }
+
+    logInfo(ROUTE, `Brief generated: "${brief.hookStatement}" (score: ${brief.viralScore})`)
+  }
+
+  const concept = requestConcept
+  const scenes = requestScenes!
+  const music: MusicInput | undefined = body.music
+  const assembly: AssemblyInput = body.assembly || {}
+  const videoModel: string | undefined = body.videoModel
 
   if (!concept || typeof concept !== "string") {
     return NextResponse.json({ error: "concept (string) is required" }, { status: 400 })
-  }
-
-  if (!scenes || !Array.isArray(scenes) || scenes.length === 0) {
-    return NextResponse.json({ error: "scenes array with at least 1 scene is required" }, { status: 400 })
   }
 
   if (scenes.length > 8) {
@@ -120,24 +178,42 @@ export async function POST(request: NextRequest) {
       scenes.map(async (scene) => {
         if (scene.imageDataUrl) {
           logInfo(ROUTE, "Using provided image, skipping generation")
-          return { imageDataUrl: scene.imageDataUrl, skipped: true }
+          return { imageDataUrl: scene.imageDataUrl, skipped: true, auditResult: undefined as ImageAuditResult | undefined }
         }
-        // Append orientation to prompt so Nano Banana generates correct aspect ratio
+
         const orientedPrompt = scene.imagePrompt + orientationSuffix
-        const result = await generateImage(orientedPrompt)
+
+        // Generate with audit enabled
+        const result = await generateImage(orientedPrompt, {
+          audit: true,
+          auditAspectRatio: aspectRatio,
+          maxRetries: 1,
+        })
+
         costs.images += IMAGE_COST
-        return { imageDataUrl: result.imageDataUrl, skipped: false }
+
+        // Log audit result
+        if (result.auditResult) {
+          const status = result.auditResult.pass ? "✓" : "✗"
+          const retry = result.retried ? " (retried)" : ""
+          logInfo(ROUTE, `Image ${status}: score ${result.auditResult.score}/10${retry}`)
+          if (!result.auditResult.pass && result.auditResult.issues.length > 0) {
+            logWarn(ROUTE, `  Issues: ${result.auditResult.issues.join(", ")}`)
+          }
+        }
+
+        return { imageDataUrl: result.imageDataUrl, skipped: false, auditResult: result.auditResult }
       })
     )
 
     // Collect successful images, track failures
-    const imageData: Array<{ imageDataUrl: string; index: number }> = []
+    const imageData: Array<{ imageDataUrl: string; index: number; auditResult?: ImageAuditResult }> = []
     const failedScenes: number[] = []
 
     for (let i = 0; i < imageResults.length; i++) {
       if (imageResults[i].status === "fulfilled") {
-        const val = (imageResults[i] as PromiseFulfilledResult<{ imageDataUrl: string; skipped: boolean }>).value
-        imageData.push({ imageDataUrl: val.imageDataUrl, index: i })
+        const val = (imageResults[i] as PromiseFulfilledResult<{ imageDataUrl: string; skipped: boolean; auditResult?: ImageAuditResult }>).value
+        imageData.push({ imageDataUrl: val.imageDataUrl, index: i, auditResult: val.auditResult })
       } else {
         const reason = (imageResults[i] as PromiseRejectedResult).reason
         logWarn(ROUTE, `Scene ${i} image failed: ${reason}`)
@@ -155,7 +231,7 @@ export async function POST(request: NextRequest) {
     logInfo(ROUTE, "Step 2: Generating videos and music in parallel")
 
     // Video generation promises
-    const videoPromises = imageData.map(async ({ imageDataUrl, index }) => {
+    const videoPromises = imageData.map(async ({ imageDataUrl, index, auditResult }) => {
       const scene = scenes[index]
       const duration = Math.min(Math.max(Math.round(scene.duration || 4), 4), 8)
 
@@ -181,28 +257,33 @@ export async function POST(request: NextRequest) {
         originalDuration: duration,
         imagePrompt: scene.imagePrompt,
         animationPrompt: scene.animationPrompt,
+        auditResult,
       }
     })
 
     // Music generation promise (parallel with videos)
+    // Always generate music. If no params provided, infer from concept.
     let musicDataUrl: string | null = null
     const musicPromise = (async () => {
-      if (!music) return null
-      if (music.musicDataUrl) {
+      if (music?.musicDataUrl) {
         logInfo(ROUTE, "Using provided music, skipping generation")
         return music.musicDataUrl
       }
+
+      const musicPrompt = music?.prompt || `${concept}. Cinematic, emotional, dynamic.`
+      const musicVocals = music?.vocals ?? false
+      const musicDuration = music?.duration || 20
+      const musicBpm = music?.bpm || 110
+
       try {
-        logInfo(ROUTE, "Starting music generation...")
+        logInfo(ROUTE, `Generating music (vocals: ${musicVocals}, bpm: ${musicBpm})...`)
         const result = await generateMusic(
-          music.instrumental !== false && !music.vocals
-            ? `${music.prompt}. Instrumental only, no vocals.`
-            : music.prompt,
+          musicVocals ? musicPrompt : `${musicPrompt}. Instrumental only, no vocals.`,
           {
-            duration: music.duration || 20,
-            bpm: music.bpm || 120,
-            instrumental: music.instrumental !== false,
-            vocals: music.vocals || false,
+            duration: musicDuration,
+            bpm: musicBpm,
+            instrumental: !musicVocals,
+            vocals: musicVocals,
           }
         )
         costs.music += MUSIC_COST
@@ -210,7 +291,7 @@ export async function POST(request: NextRequest) {
         return result.audioDataUrl
       } catch (err) {
         logWarn(ROUTE, `Music generation failed: ${(err as Error).message}`)
-        return null // Non-fatal — video works without music
+        return null
       }
     })()
 
@@ -234,6 +315,7 @@ export async function POST(request: NextRequest) {
           trimmedDuration: null, // set after assembly
           imagePrompt: val.imagePrompt,
           animationPrompt: val.animationPrompt,
+          auditResult: val.auditResult,
         })
       } else {
         logWarn(ROUTE, `Video generation failed: ${result.reason}`)
@@ -289,6 +371,7 @@ export async function POST(request: NextRequest) {
       id: uuid(),
       status: "complete",
       concept,
+      brief: requestBrief || undefined,
       videoDataUrl: assemblyResult.videoDataUrl,
       duration: assemblyResult.duration,
       fileSize: assemblyResult.fileSize,
@@ -299,6 +382,7 @@ export async function POST(request: NextRequest) {
         trimmedDuration: s.trimmedDuration,
         imagePrompt: s.imagePrompt,
         animationPrompt: s.animationPrompt,
+        auditResult: s.auditResult,
       })),
       musicDataUrl,
       cost: {

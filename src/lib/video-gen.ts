@@ -52,7 +52,6 @@ export async function generateVideo(
     model: activeModel,
     prompt,
     config: {
-      durationSeconds: duration,
       aspectRatio,
     },
   }
