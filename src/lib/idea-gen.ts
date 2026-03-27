@@ -1,5 +1,6 @@
 import { getGeminiClient, GEMINI_FLASH } from "./gemini"
 import { logInfo, logWarn } from "./logger"
+import { buildLearningContext } from "./brief-history"
 
 const ROUTE = "idea-gen"
 
@@ -72,7 +73,8 @@ SCORING CRITERIA (HONEST):
 
 CONSTRAINTS:
 - Must be 30-60s format (9:16 vertical)
-- Max 2-3 scenes (production time)
+- 3-5 scenes depending on concept needs (3 for tight focused concepts, 4-5 for narrative arcs or transformations)
+- Scene 1 MUST be a strong hook/pattern interrupt — it determines if viewers stay
 - No talking heads or tutorials (ghostkey is about aesthetics + tools, not education)
 - No heavy text overlays (visuals first)
 - Music is CRITICAL — match tone to visuals
@@ -135,6 +137,9 @@ function validateBrief(brief: ContentBrief): string[] {
 export async function generateIdea(input: IdeaGenInput): Promise<ContentBrief> {
   const ai = getGeminiClient()
 
+  // Build learning context from past briefs
+  const learningContext = buildLearningContext()
+
   const userPrompt = `Generate a viral reel brief for this brand:
 
 Brand: ${input.brand}
@@ -143,7 +148,7 @@ Platform: ${input.platform}
 Format: ${input.format}
 Tone: ${input.tone || "cinematic professional"}
 Avoid: ${input.avoid?.join(", ") || "none"}
-
+${learningContext}
 Return ONE content brief with the highest viral potential. JSON only.
 ${input.count && input.count > 1 ? `Also include alternatives array with ${input.count - 1} alternative briefs.` : ""}`
 
